@@ -1,9 +1,8 @@
 .env
 
-./fotos
 
 modelo_lbph.yml
 
 nomes_lbph.json
 
-fotos
+fotos/
