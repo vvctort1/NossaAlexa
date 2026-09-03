@@ -241,6 +241,20 @@ class Agenda:
             partes.append(f"Tarefa {indice}: {item['tarefa']}.")
         return " ".join(partes)
 
+    def limpar(self) -> str:
+        """Apaga todas as tarefas da agenda sobreescrevendo com uma lista vazia."""
+        if not os.path.exists(self._caminho_arquivo):
+            return "Sua agenda já está vazia."
+
+        tarefas = self._carregar_tarefas()
+        if not tarefas:
+            return "Sua agenda já está vazia."
+
+        # Salva uma lista vazia no arquivo JSON
+        self._salvar_tarefas([])
+
+        return "Pronto, apaguei todas as tarefas da sua agenda."
+
     def _carregar_tarefas(self) -> List[dict]:
         if not os.path.exists(self._caminho_arquivo):
             return []
@@ -519,6 +533,28 @@ class ComandoLerAgenda(Comando):
         assistente.voz.falar(assistente.agenda.ler())
 
 
+class ComandoLimparAgenda(Comando):
+    palavras_chave = ["limpar agenda", "apagar agenda", "esvaziar agenda", "apagar tarefas", "limpar tarefas"]
+
+    def executar(self, texto_original, texto_lower, assistente):
+        if not self._confirmar_pessoa_autorizada(assistente):
+            return
+
+        assistente.voz.falar(assistente.agenda.limpar())
+
+    def _confirmar_pessoa_autorizada(self, assistente: "AssistenteEva") -> bool:
+        """Reaproveita a lógica de segurança para evitar que qualquer um apague a agenda."""
+        assistente.voz.falar("Confirmando sua identidade para apagar a agenda.")
+        pessoa = assistente.reconhecimento.identificar_pessoa_atual()
+        assistente.usuario_atual = pessoa
+
+        if pessoa is None or pessoa.lower() not in assistente.pessoas_autorizadas:
+            print("Acesso negado: pessoa não reconhecida/autorizada na confirmação.")
+            assistente.voz.falar("Não consegui confirmar sua identidade, então não vou apagar a agenda.")
+            return False
+        return True
+
+
 class ComandoTocarPlaylist(Comando):
     palavras_chave = [
         "tocar a playlist",
@@ -589,6 +625,7 @@ def comandos_padrao() -> List[Comando]:
         ComandoAdicionarTarefa(),
         ComandoQuemSouEu(),
         ComandoLerAgenda(),
+        ComandoLimparAgenda(),
         ComandoTocarPlaylist(),
         ComandoProximaMusica(),
         ComandoMusicaAnterior(),
