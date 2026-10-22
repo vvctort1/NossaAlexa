@@ -1,4 +1,6 @@
 from __future__ import annotations
+import platform
+import subprocess
 import asyncio
 import io
 import json
@@ -15,7 +17,7 @@ import speech_recognition as sr
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-
+import time
 
 # Configuração
 CAMINHO_MODELO_FACIAL = "modelo_lbph.yml"
@@ -31,6 +33,69 @@ WAKE_WORD = "eva"
 
 URL_OLLAMA = "http://localhost:11434/api/generate"
 MODELO_OLLAMA = "gemma4:26b"
+
+
+# Volume do Sistema
+class ServicoVolume:
+    """Controla o volume nativo do sistema operacional (macOS ou Windows)."""
+
+    def __init__(self):
+        self._sistema = platform.system()
+
+    def aumentar(self) -> None:
+        if self._sistema == "Darwin":  # macOS
+            subprocess.run(["osascript", "-e", "set volume output volume (output volume of (get volume settings) + 10)"])
+        elif self._sistema == "Windows":
+            # Pressiona a tecla de volume UP 5 vezes (cada toque sobe 2%)
+            comando = "(new-object -com wscript.shell).SendKeys([char]175)"
+            for _ in range(5):
+                subprocess.run(["powershell", "-Command", comando], capture_output=True)
+
+    def diminuir(self) -> None:
+        if self._sistema == "Darwin":  # macOS
+            subprocess.run(["osascript", "-e", "set volume output volume (output volume of (get volume settings) - 10)"])
+        elif self._sistema == "Windows":
+            # Pressiona a tecla de volume DOWN 5 vezes
+            comando = "(new-object -com wscript.shell).SendKeys([char]174)"
+            for _ in range(5):
+                subprocess.run(["powershell", "-Command", comando], capture_output=True)
+
+
+
+## CORPO EVA
+
+class CorpoEva:
+    """Controla o hardware físico via requisições HTTP locais para o ESP32."""
+
+    def __init__(self, ip_esp32: str):
+        self._url_base = f"http://{ip_esp32}"
+
+    def _enviar_comando(self, rota: str) -> None:
+        try:
+            requests.get(f"{self._url_base}/{rota}", timeout=1)
+        except requests.RequestException:
+            pass  # Ignora erros silenciosamente para não travar a voz
+
+    def acordar(self) -> None:
+        self._enviar_comando("acordar")
+
+    def acenar(self) -> None:
+        self._enviar_comando("acenar")
+
+    def sorrir(self) -> None:
+        self._enviar_comando("sorrir")
+
+    def dormir(self) -> None:
+        self._enviar_comando("dormir")
+
+    def pensar(self) -> None:
+        self._enviar_comando("pensar")
+
+    def estado_normal(self) -> None:
+        self._enviar_comando("acordar")
+
+
+
 
 
 # Reconhecimento facial
@@ -124,12 +189,24 @@ class SintetizadorDeVoz:
     def __init__(self, voz: str = VOZ_EVA, nome_exibido: str = "Eva"):
         self._voz = voz
         self._nome_exibido = nome_exibido
+        self._corpo = None
         pygame.mixer.init()
+
+    def definir_corpo(self, corpo) -> None:
+        """Recebe a referência do corpo para mudar expressões antes de falar."""
+        self._corpo = corpo
 
     def falar(self, texto: str) -> None:
         print(f"{self._nome_exibido}: {texto}")
         try:
+            # 1. Enquanto baixa e gera o áudio, a Eva continua com a expressão "pensando"
             audio_buffer = asyncio.run(self._gerar_audio_memoria(texto))
+
+            # 2. Áudio pronto! Volta a abrir os olhos exatamente antes de começar a falar
+            if self._corpo:
+                self._corpo.estado_normal()
+
+            # 3. Reproduz o som
             self._reproduzir(audio_buffer)
         except Exception as erro:
             print(f"[Erro no motor de voz]: {erro}")
@@ -214,19 +291,22 @@ class Agenda:
     def __init__(self, caminho_arquivo: str = ARQUIVO_AGENDA):
         self._caminho_arquivo = caminho_arquivo
 
-    def adicionar(self, tarefa: str) -> str:
+    def adicionar(self, tarefa: str, quando: str) -> str:
         tarefa = (tarefa or "").strip()
+        quando = (quando or "sem data definida").strip()
+
         if not tarefa:
             return "Você não me disse qual é a tarefa."
 
         tarefas = self._carregar_tarefas()
         tarefas.append({
             "tarefa": tarefa,
+            "quando": quando,  # NOVO CAMPO GRAVADO NO JSON
             "data_registro": datetime.now().strftime("%d/%m/%Y %H:%M"),
         })
         self._salvar_tarefas(tarefas)
 
-        return f"Pronto, anotei na sua agenda: {tarefa}."
+        return f"Pronto, anotei na sua agenda: {tarefa}, para {quando}."
 
     def ler(self) -> str:
         if not os.path.exists(self._caminho_arquivo):
@@ -238,7 +318,10 @@ class Agenda:
 
         partes = [f"Você tem {len(tarefas)} tarefas na agenda."]
         for indice, item in enumerate(tarefas, start=1):
-            partes.append(f"Tarefa {indice}: {item['tarefa']}.")
+            # Lê o campo 'quando' (se for uma tarefa antiga sem esse campo, diz "sem data definida")
+            quando = item.get("quando", "sem data definida")
+            partes.append(f"Tarefa {indice}: {item['tarefa']}, marcada para {quando}.")
+
         return " ".join(partes)
 
     def limpar(self) -> str:
@@ -470,21 +553,26 @@ class ComandoAdicionarTarefa(Comando):
     ]
 
     def executar(self, texto_original, texto_lower, assistente):
+        # 1. Verifica biometria
         if not self._confirmar_pessoa_autorizada(assistente):
             return
 
+        # 2. Descobre qual é a tarefa
         tarefa = self._extrair_tarefa(texto_lower)
         if not tarefa:
-            tarefa = self._perguntar_tarefa(assistente)
+            tarefa = self._perguntar(assistente, "O que você quer que eu anote?")
             if not tarefa:
                 return
 
-        assistente.voz.falar(assistente.agenda.adicionar(tarefa))
+        # 3. NOVO: Pergunta a data e hora
+        quando = self._perguntar(assistente, f"Para quando é essa tarefa?")
+        if not quando:
+            quando = "sem data definida"
+
+        # 4. Salva a tarefa com a data/hora
+        assistente.voz.falar(assistente.agenda.adicionar(tarefa, quando))
 
     def _confirmar_pessoa_autorizada(self, assistente: "AssistenteEva") -> bool:
-        # Segurança extra: reconfirma quem está na câmera AGORA, mesmo que a
-        # pessoa já tenha sido reconhecida no início da sessão — evita que o
-        # comando seja usado por outra pessoa depois da checagem inicial.
         assistente.voz.falar("Confirmando sua identidade.")
         pessoa = assistente.reconhecimento.identificar_pessoa_atual()
         assistente.usuario_atual = pessoa
@@ -496,10 +584,7 @@ class ComandoAdicionarTarefa(Comando):
         return True
 
     def _extrair_tarefa(self, texto: str) -> str:
-        """Corta a frase logo depois do gatilho que a disparou e retorna o que sobrou."""
         texto_lower = texto.lower()
-        # Do gatilho mais longo pro mais curto, pra não cortar errado quando
-        # um gatilho é prefixo de outro (ex: "tarefa" dentro de "uma tarefa").
         for gatilho in sorted(self.palavras_chave, key=len, reverse=True):
             indice = texto_lower.find(gatilho)
             if indice != -1:
@@ -507,13 +592,13 @@ class ComandoAdicionarTarefa(Comando):
         return ""
 
     @staticmethod
-    def _perguntar_tarefa(assistente: "AssistenteEva") -> Optional[str]:
-        assistente.voz.falar("O que você quer que eu anote?")
-        tarefa = assistente.ouvir_resposta_simples()
-        if not tarefa:
-            assistente.voz.falar("Não consegui te ouvir, tenta de novo.")
-        return tarefa
-
+    def _perguntar(assistente: "AssistenteEva", pergunta: str) -> Optional[str]:
+        """Função auxiliar para fazer uma pergunta e ouvir a resposta em seguida."""
+        assistente.voz.falar(pergunta)
+        resposta = assistente.ouvir_resposta_simples()
+        if not resposta:
+            assistente.voz.falar("Não consegui te ouvir direito.")
+        return resposta
 
 class ComandoQuemSouEu(Comando):
     palavras_chave = ["quem sou eu", "quem esta ai", "quem está aí"]
@@ -530,7 +615,21 @@ class ComandoLerAgenda(Comando):
     palavras_chave = ["ler agenda", "minhas tarefas", "o que tem na agenda"]
 
     def executar(self, texto_original, texto_lower, assistente):
+        if not self._confirmar_pessoa_autorizada(assistente):
+            return
         assistente.voz.falar(assistente.agenda.ler())
+
+    def _confirmar_pessoa_autorizada(self, assistente: "AssistenteEva") -> bool:
+        """Reaproveita a lógica de segurança para evitar que qualquer um apague a agenda."""
+        assistente.voz.falar("Confirmando sua identidade para ler a agenda.")
+        pessoa = assistente.reconhecimento.identificar_pessoa_atual()
+        assistente.usuario_atual = pessoa
+
+        if pessoa is None or pessoa.lower() not in assistente.pessoas_autorizadas:
+            print("Acesso negado: pessoa não reconhecida/autorizada na confirmação.")
+            assistente.voz.falar("Não consegui confirmar sua identidade, então não vou ler a agenda.")
+            return False
+        return True
 
 
 class ComandoLimparAgenda(Comando):
@@ -614,6 +713,40 @@ class ComandoRetomarMusica(Comando):
     def executar(self, texto_original, texto_lower, assistente):
         assistente.voz.falar(assistente.spotify.retomar_musica())
 
+
+class ComandoAumentarVolume(Comando):
+    palavras_chave = ["aumentar volume", "aumentar o volume", "aumenta o volume", "mais alto", "aumentar som", "aumentar o som"]
+
+    def executar(self, texto_original, texto_lower, assistente):
+        assistente.voz.falar("Aumentando o volume do sistema.")
+        assistente.volume.aumentar()
+
+class ComandoDiminuirVolume(Comando):
+    palavras_chave = ["diminuir volume", "diminuir o volume", "abaixar volume", "abaixar o volume", "mais baixo", "diminuir o som", "diminuir som", "diminui o som"]
+
+    def executar(self, texto_original, texto_lower, assistente):
+        assistente.voz.falar("Abaixando o volume do sistema.")
+        assistente.volume.diminuir()
+
+
+class ComandoSorrir(Comando):
+    palavras_chave = ["sorria", "dê um sorriso", "dar um sorriso", "sorrir"]
+
+    def executar(self, texto_original, texto_lower, assistente):
+        assistente.voz.falar("Claro!")
+        assistente.corpo.sorrir()
+        time.sleep(3)
+        return None # Mantém a assistente ativa
+
+class ComandoAcenar(Comando):
+    palavras_chave = ["acene", "diga oi", "acenar", "dar oi", "oi", "olá"]
+
+    def executar(self, texto_original, texto_lower, assistente):
+        assistente.voz.falar("Olá!")
+        assistente.corpo.acenar()
+        return None
+
+
 def comandos_padrao() -> List[Comando]:
     """Lista padrão de comandos que a Eva sabe executar."""
     return [
@@ -631,6 +764,10 @@ def comandos_padrao() -> List[Comando]:
         ComandoMusicaAnterior(),
         ComandoPausarMusica(),
         ComandoRetomarMusica(),
+        ComandoAumentarVolume(),
+        ComandoDiminuirVolume(),
+        ComandoSorrir(),
+        ComandoAcenar(),
     ]
 
 
@@ -665,30 +802,76 @@ class AssistenteEva:
         clima: ServicoClima,
         agenda: Agenda,
         spotify: ServicoSpotify,
+        volume: ServicoVolume,
         roteador: RoteadorDeComandos,
         pessoas_autorizadas: set,
+        corpo: CorpoEva,
         wake_word: str = WAKE_WORD,
+
     ):
         self.reconhecimento = reconhecimento
         self.voz = voz
         self.clima = clima
         self.agenda = agenda
         self.spotify = spotify
+        self.volume = volume
         self.roteador = roteador
         self.pessoas_autorizadas = pessoas_autorizadas
         self._wake_word = wake_word
+        self.corpo = corpo
 
         self.usuario_atual: Optional[str] = None
         self._reconhecedor_fala = sr.Recognizer()
+
+    def _cumprimentar(self) -> None:
+        self.corpo.acordar()  # 1. Acorda imediatamente (abre os olhos normais)
+        print("Tentando reconhecer quem está na frente da câmera...")
+
+        self.usuario_atual = self.reconhecimento.identificar_pessoa_atual()
+        if self.usuario_atual:
+            self.voz.falar(f"Oi, {self.usuario_atual}! Só um momento...")
+        else:
+            self.voz.falar("Sistema inicializando. Não consegui te reconhecer. Aguarde um momento...")
 
     def iniciar(self) -> None:
         self._cumprimentar()
         with sr.Microphone() as microfone:
             self._reconhecedor_fala.adjust_for_ambient_noise(microfone, duration=2)
-            # Só depois do ajuste de ruído o microfone está de fato pronto pra
-            # capturar — por isso essa fala vem aqui, e só uma vez.
-            self.voz.falar("Obrigado por esperar. Se precisar de alguma coisa, estou ouvindo.")
+
+            # 2. Acena e sorri quando está pronta para ouvir
+            self.corpo.acenar()
+            self.voz.falar("Obrigado por esperar. O sistema foi iniciado e agora estou ouvindo.")
+            self.corpo.estado_normal()  # Volta à expressão atenta/normal
+
             self._laco_principal(microfone)
+
+    def _laco_principal(self, microfone) -> None:
+        while True:
+            print("\nOuvindo...")
+            try:
+                audio = self._reconhecedor_fala.listen(microfone, timeout=5, phrase_time_limit=10)
+                texto = self._reconhecedor_fala.recognize_google(audio, language="pt-BR")
+
+                if self._wake_word in texto.lower():
+                    print(f"Você falou: {texto}")
+
+                    # 3. Fica com olhos pensativos enquanto processa o comando
+                    self.corpo.pensar()
+
+                    resultado = self.roteador.rotear(texto, texto.lower(), self)
+
+                    if resultado == "ENCERRAR":
+                        self.corpo.dormir()  # 4. Tela preta ao desligar
+                        break
+                    else:
+                        self.corpo.estado_normal()  # Volta ao normal após responder a qualquer outro comando
+
+            except sr.WaitTimeoutError:
+                pass
+            except sr.UnknownValueError:
+                pass
+            except Exception as erro:
+                print(f"Erro na captação: {erro}")
 
     def ouvir_resposta_simples(self, timeout: int = 6, phrase_time_limit: int = 10) -> Optional[str]:
         """Abre o microfone por uma frase só, para capturar a resposta a uma pergunta da Eva."""
@@ -700,33 +883,7 @@ class AssistenteEva:
         except (sr.WaitTimeoutError, sr.UnknownValueError):
             return None
 
-    def _cumprimentar(self) -> None:
-        print("Tentando reconhecer quem está na frente da câmera...")
-        self.usuario_atual = self.reconhecimento.identificar_pessoa_atual()
-        if self.usuario_atual:
-            self.voz.falar(f"Oi, {self.usuario_atual}! Só um momento...")
-        else:
-            self.voz.falar("Sistema iniciado. Não consegui te reconhecer. Aguarde um momento...")
 
-    def _laco_principal(self, microfone) -> None:
-        while True:
-            print("\nOuvindo...")
-            try:
-                audio = self._reconhecedor_fala.listen(microfone, timeout=5, phrase_time_limit=10)
-                texto = self._reconhecedor_fala.recognize_google(audio, language="pt-BR")
-
-                if self._wake_word in texto.lower():
-                    print(f"Você falou: {texto}")
-                    resultado = self.roteador.rotear(texto, texto.lower(), self)
-                    if resultado == "ENCERRAR":
-                        break
-
-            except sr.WaitTimeoutError:
-                pass
-            except sr.UnknownValueError:
-                pass
-            except Exception as erro:
-                print(f"Erro na captação: {erro}")
 
 
 # Composição e execução
@@ -739,6 +896,7 @@ def montar_assistente() -> AssistenteEva:
     llm = ClienteLLM()
     clima = ServicoClima(api_key=os.getenv("API_KEY_OPENWEATHER"))
     agenda = Agenda()
+    volume = ServicoVolume()
 
     spotify = ServicoSpotify(
         client_id=os.getenv("SPOTIPY_CLIENT_ID"),
@@ -749,13 +907,19 @@ def montar_assistente() -> AssistenteEva:
 
     roteador = RoteadorDeComandos(comandos_padrao(), llm)
 
+    corpo = CorpoEva(ip_esp32=os.getenv("IP_ESP32"))
+
+    voz.definir_corpo(corpo)
+
     return AssistenteEva(
         reconhecimento=reconhecimento,
         voz=voz,
         clima=clima,
         agenda=agenda,
         spotify=spotify,
+        volume=volume,
         roteador=roteador,
+        corpo=corpo,
         pessoas_autorizadas=PESSOAS_AUTORIZADAS,
     )
 
