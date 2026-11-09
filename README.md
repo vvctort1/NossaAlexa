@@ -52,7 +52,7 @@ A "carcaça" da Eva foi projetada para abrigar a eletrônica de forma compacta, 
 
 ---
 
-## 🚀 Instruções de Instalação e Execução
+## Instruções de Instalação e Execução
 
 ### 1. Configuração do Hardware (ESP32)
 1. Conecte os componentes ao ESP32 conforme o mapeamento I2C (OLEDs), I2S (Microfone: WS=15, SCK=2, SD=4), PIR (Pino 14) e Servo (Pino 13).
