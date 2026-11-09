@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import time
+import threading
+import logging
+from flask import Flask
 
 # Configuração
 CAMINHO_MODELO_FACIAL = "modelo_lbph.yml"
@@ -29,10 +32,18 @@ ARQUIVO_AGENDA = "minha_agenda.json"
 PESSOAS_AUTORIZADAS = {"victor"}
 
 VOZ_EVA = "pt-BR-FranciscaNeural"
-WAKE_WORD = "eva"
+WAKE_WORD = "eva"  # Mantido por compatibilidade, mas o gatilho agora é a palma via ESP32
 
 URL_OLLAMA = "http://localhost:11434/api/generate"
 MODELO_OLLAMA = "gemma4:26b"
+
+# Inicialização do Flask
+app = Flask(__name__)
+# Desativa os logs de GET do Flask para manter o terminal limpo
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+assistente_global: Optional["AssistenteEva"] = None
 
 
 # Volume do Sistema
@@ -44,26 +55,24 @@ class ServicoVolume:
 
     def aumentar(self) -> None:
         if self._sistema == "Darwin":  # macOS
-            subprocess.run(["osascript", "-e", "set volume output volume (output volume of (get volume settings) + 10)"])
+            subprocess.run(
+                ["osascript", "-e", "set volume output volume (output volume of (get volume settings) + 10)"])
         elif self._sistema == "Windows":
-            # Pressiona a tecla de volume UP 5 vezes (cada toque sobe 2%)
             comando = "(new-object -com wscript.shell).SendKeys([char]175)"
             for _ in range(5):
                 subprocess.run(["powershell", "-Command", comando], capture_output=True)
 
     def diminuir(self) -> None:
         if self._sistema == "Darwin":  # macOS
-            subprocess.run(["osascript", "-e", "set volume output volume (output volume of (get volume settings) - 10)"])
+            subprocess.run(
+                ["osascript", "-e", "set volume output volume (output volume of (get volume settings) - 10)"])
         elif self._sistema == "Windows":
-            # Pressiona a tecla de volume DOWN 5 vezes
             comando = "(new-object -com wscript.shell).SendKeys([char]174)"
             for _ in range(5):
                 subprocess.run(["powershell", "-Command", comando], capture_output=True)
 
 
-
 ## CORPO EVA
-
 class CorpoEva:
     """Controla o hardware físico via requisições HTTP locais para o ESP32."""
 
@@ -74,7 +83,7 @@ class CorpoEva:
         try:
             requests.get(f"{self._url_base}/{rota}", timeout=1)
         except requests.RequestException:
-            pass  # Ignora erros silenciosamente para não travar a voz
+            pass
 
     def acordar(self) -> None:
         self._enviar_comando("acordar")
@@ -95,19 +104,16 @@ class CorpoEva:
         self._enviar_comando("acordar")
 
 
-
-
-
 # Reconhecimento facial
 class ReconhecimentoFacial:
     """Identifica quem está na frente da câmera usando um modelo LBPH já treinado."""
 
     def __init__(
-        self,
-        caminho_modelo: str = CAMINHO_MODELO_FACIAL,
-        caminho_nomes: str = CAMINHO_NOMES_FACIAL,
-        caminho_xml: str = CAMINHO_XML_FACIAL,
-        confianca_maxima: int = CONFIANCA_MAXIMA_FACIAL,
+            self,
+            caminho_modelo: str = CAMINHO_MODELO_FACIAL,
+            caminho_nomes: str = CAMINHO_NOMES_FACIAL,
+            caminho_xml: str = CAMINHO_XML_FACIAL,
+            confianca_maxima: int = CONFIANCA_MAXIMA_FACIAL,
     ):
         self._caminho_modelo = caminho_modelo
         self._caminho_nomes = caminho_nomes
@@ -120,13 +126,12 @@ class ReconhecimentoFacial:
         self._pronto = False
 
     def _carregar(self) -> bool:
-        """Carrega o modelo treinado uma única vez (lazy loading)."""
         if self._pronto:
             return True
 
         arquivos_necessarios = (self._caminho_modelo, self._caminho_nomes, self._caminho_xml)
         if not all(os.path.exists(caminho) for caminho in arquivos_necessarios):
-            print("[reconhecimento] Modelo ainda não foi treinado (rode o script de treino e aperte 'r').")
+            print("[reconhecimento] Modelo ainda não foi treinado.")
             return False
 
         self._classificador = cv2.CascadeClassifier(self._caminho_xml)
@@ -141,7 +146,6 @@ class ReconhecimentoFacial:
         return True
 
     def identificar_pessoa_atual(self, tentativas: int = 35) -> Optional[str]:
-        """Abre a câmera, tenta reconhecer um rosto por algumas tentativas e retorna o nome (ou None)."""
         if not self._carregar():
             return None
 
@@ -160,8 +164,7 @@ class ReconhecimentoFacial:
 
     def _tentar_reconhecer_um_frame(self, camera, clahe) -> Optional[str]:
         status, imagem = camera.read()
-        if not status:
-            return None
+        if not status: return None
 
         cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
         equalizada = clahe.apply(cinza)
@@ -169,12 +172,10 @@ class ReconhecimentoFacial:
         faces = self._classificador.detectMultiScale(
             equalizada, scaleFactor=1.1, minNeighbors=6, minSize=(100, 100)
         )
-        if len(faces) == 0:
-            return None
+        if len(faces) == 0: return None
 
-        # Pega só o maior rosto (assume-se que é o mais próximo da câmera)
         x, y, largura, altura = max(faces, key=lambda f: f[2] * f[3])
-        rosto = cv2.resize(equalizada[y : y + altura, x : x + largura], (220, 220))
+        rosto = cv2.resize(equalizada[y: y + altura, x: x + largura], (220, 220))
 
         id_previsto, confianca = self._reconhecedor.predict(rosto)
         if confianca < self._confianca_maxima:
@@ -184,8 +185,6 @@ class ReconhecimentoFacial:
 
 # Voz (texto -> fala)
 class SintetizadorDeVoz:
-    """Converte texto em áudio (edge-tts) e reproduz direto da memória (pygame), sem criar arquivo."""
-
     def __init__(self, voz: str = VOZ_EVA, nome_exibido: str = "Eva"):
         self._voz = voz
         self._nome_exibido = nome_exibido
@@ -193,20 +192,14 @@ class SintetizadorDeVoz:
         pygame.mixer.init()
 
     def definir_corpo(self, corpo) -> None:
-        """Recebe a referência do corpo para mudar expressões antes de falar."""
         self._corpo = corpo
 
     def falar(self, texto: str) -> None:
         print(f"{self._nome_exibido}: {texto}")
         try:
-            # 1. Enquanto baixa e gera o áudio, a Eva continua com a expressão "pensando"
             audio_buffer = asyncio.run(self._gerar_audio_memoria(texto))
-
-            # 2. Áudio pronto! Volta a abrir os olhos exatamente antes de começar a falar
             if self._corpo:
                 self._corpo.estado_normal()
-
-            # 3. Reproduz o som
             self._reproduzir(audio_buffer)
         except Exception as erro:
             print(f"[Erro no motor de voz]: {erro}")
@@ -229,14 +222,11 @@ class SintetizadorDeVoz:
 
     @staticmethod
     def limpar_texto_para_voz(texto: str) -> str:
-        """Remove marcações de Markdown/caracteres especiais que soam estranho quando falados."""
         return re.sub(r"[*#_`\n]", " ", texto)
 
 
 # LLM local (fallback de conversa livre)
 class ClienteLLM:
-    """Cliente simples para o modelo local rodando via Ollama."""
-
     def __init__(self, url: str = URL_OLLAMA, modelo: str = MODELO_OLLAMA):
         self._url = url
         self._modelo = modelo
@@ -256,8 +246,6 @@ class ClienteLLM:
 
 # Clima
 class ServicoClima:
-    """Consulta condições climáticas atuais via OpenWeather."""
-
     _URL_BASE = "http://api.openweathermap.org/data/2.5/weather"
 
     def __init__(self, api_key: Optional[str]):
@@ -271,7 +259,6 @@ class ServicoClima:
                 timeout=10,
             )
             dados = resposta.json()
-
             if str(dados.get("cod")) != "200":
                 return f"Desculpe, não consegui encontrar a previsão do tempo para a cidade de {cidade}."
 
@@ -280,67 +267,48 @@ class ServicoClima:
             nome_cidade = dados["name"]
             return f"A temperatura atual em {nome_cidade} é de {temperatura} graus, com {descricao}."
         except Exception as erro:
-            print(f"Erro na API de clima: {erro}")
             return "Ocorreu um erro de conexão ao tentar consultar o clima."
 
 
 # Agenda
 class Agenda:
-    """Persiste e lê tarefas simples num arquivo JSON."""
-
     def __init__(self, caminho_arquivo: str = ARQUIVO_AGENDA):
         self._caminho_arquivo = caminho_arquivo
 
     def adicionar(self, tarefa: str, quando: str) -> str:
         tarefa = (tarefa or "").strip()
         quando = (quando or "sem data definida").strip()
-
-        if not tarefa:
-            return "Você não me disse qual é a tarefa."
+        if not tarefa: return "Você não me disse qual é o nome do cliente."
 
         tarefas = self._carregar_tarefas()
         tarefas.append({
             "tarefa": tarefa,
-            "quando": quando,  # NOVO CAMPO GRAVADO NO JSON
+            "quando": quando,
             "data_registro": datetime.now().strftime("%d/%m/%Y %H:%M"),
         })
         self._salvar_tarefas(tarefas)
-
         return f"Pronto, anotei na sua agenda: {tarefa}, para {quando}."
 
     def ler(self) -> str:
-        if not os.path.exists(self._caminho_arquivo):
-            return "Sua agenda está vazia. Você ainda não anotou nada."
-
+        if not os.path.exists(self._caminho_arquivo): return "Sua agenda está vazia."
         tarefas = self._carregar_tarefas()
-        if not tarefas:
-            return "Você não tem nenhuma tarefa pendente."
+        if not tarefas: return "Você não tem nenhum cliente pendente."
 
-        partes = [f"Você tem {len(tarefas)} tarefas na agenda."]
+        partes = [f"Você tem {len(tarefas)} cliente agendado."]
         for indice, item in enumerate(tarefas, start=1):
-            # Lê o campo 'quando' (se for uma tarefa antiga sem esse campo, diz "sem data definida")
             quando = item.get("quando", "sem data definida")
-            partes.append(f"Tarefa {indice}: {item['tarefa']}, marcada para {quando}.")
-
+            partes.append(f"Cliente {indice}: {item['tarefa']}, marcada para {quando}.")
         return " ".join(partes)
 
     def limpar(self) -> str:
-        """Apaga todas as tarefas da agenda sobreescrevendo com uma lista vazia."""
-        if not os.path.exists(self._caminho_arquivo):
-            return "Sua agenda já está vazia."
-
+        if not os.path.exists(self._caminho_arquivo): return "Sua agenda já está vazia."
         tarefas = self._carregar_tarefas()
-        if not tarefas:
-            return "Sua agenda já está vazia."
-
-        # Salva uma lista vazia no arquivo JSON
+        if not tarefas: return "Sua agenda já está vazia."
         self._salvar_tarefas([])
-
-        return "Pronto, apaguei todas as tarefas da sua agenda."
+        return "Pronto, apaguei todos os agendamentos!"
 
     def _carregar_tarefas(self) -> List[dict]:
-        if not os.path.exists(self._caminho_arquivo):
-            return []
+        if not os.path.exists(self._caminho_arquivo): return []
         with open(self._caminho_arquivo, "r", encoding="utf-8") as arquivo:
             try:
                 return json.load(arquivo)
@@ -354,44 +322,28 @@ class Agenda:
 
 # Calculadora
 class Calculadora:
-    """Interpreta uma frase com uma operação matemática simples e resolve."""
-
     @staticmethod
     def calcular_a_partir_da_frase(texto: str) -> str:
         palavras = texto.lower().split()
         try:
-
             if palavras[1] == "quanto":
-                operador = palavras[4]
-                numero1 = float(palavras[3])
-                numero2 = float(palavras[-1])
+                operador, numero1, numero2 = palavras[4], float(palavras[3]), float(palavras[-1])
             else:
-                operador = palavras[3]
-                numero1 = float(palavras[2])
-                numero2 = float(palavras[-1])
-        except IndexError:
-            return "Ops, não ouvi os números para o cálculo por completo."
-        except ValueError:
-            return "Não consegui entender os números do cálculo."
+                operador, numero1, numero2 = palavras[3], float(palavras[2]), float(palavras[-1])
+        except (IndexError, ValueError):
+            return "Ops, não entendi os números do cálculo."
 
-        if operador == "+":
-            return f"O resultado é: {numero1 + numero2}"
-        if operador == "-":
-            return f"O resultado é: {numero1 - numero2}"
-        if operador == "x":
-            return f"O resultado é: {numero1 * numero2}"
+        if operador == "+": return f"O resultado é: {numero1 + numero2}"
+        if operador == "-": return f"O resultado é: {numero1 - numero2}"
+        if operador == "x": return f"O resultado é: {numero1 * numero2}"
         if operador == "/" or (operador == "dividido" and "por" in palavras):
-            if numero2 == 0:
-                return "Não é possível dividir por 0!"
+            if numero2 == 0: return "Não é possível dividir por 0!"
             return f"O resultado é {numero1 / numero2:.2f}"
-
         return "Não consegui realizar este cálculo."
 
 
 # Spotify
 class ServicoSpotify:
-    """Controla a reprodução de músicas via API do Spotify."""
-
     def __init__(self, client_id: str, client_secret: str, redirect_uri: str):
         self._client_id = client_id
         self._client_secret = client_secret
@@ -403,49 +355,31 @@ class ServicoSpotify:
         if not (self._client_id and self._client_secret and self._redirect_uri):
             print("[spotify] Credenciais ausentes. Serviço inativo.")
             return
-
-        # Escopos necessários para ler o estado e dar play
         escopo = "user-modify-playback-state user-read-playback-state"
-
-        gerenciador_auth = SpotifyOAuth(
-            client_id=self._client_id,
-            client_secret=self._client_secret,
-            redirect_uri=self._redirect_uri,
-            scope=escopo
-        )
+        gerenciador_auth = SpotifyOAuth(client_id=self._client_id, client_secret=self._client_secret,
+                                        redirect_uri=self._redirect_uri, scope=escopo)
         self._sp = spotipy.Spotify(auth_manager=gerenciador_auth)
 
     def tocar_playlist(self, nome_playlist: str) -> str:
-        if not self._sp:
-            return "As credenciais do Spotify não estão configuradas corretamente."
-
+        if not self._sp: return "As credenciais do Spotify não estão configuradas corretamente."
         try:
-            # 1. Busca a playlist
             resultados = self._sp.search(q=nome_playlist, type="playlist", limit=1)
             items = resultados.get("playlists", {}).get("items", [])
-
-            if not items:
-                return f"Não encontrei nenhuma playlist chamada {nome_playlist}."
+            if not items: return f"Não encontrei nenhuma playlist chamada {nome_playlist}."
 
             playlist = items[0]
             uri_playlist = playlist["uri"]
             nome_encontrado = playlist["name"]
 
-            # 2. Verifica se há algum dispositivo ativo
             dispositivos = self._sp.devices().get("devices", [])
-            if not dispositivos:
-                return "Abra o aplicativo do Spotify no seu computador ou celular primeiro."
+            if not dispositivos: return "Abra o aplicativo do Spotify no seu computador ou celular primeiro."
 
-            # 3. Dá o play no dispositivo ativo
             self._sp.start_playback(context_uri=uri_playlist)
             return f"Tocando a playlist {nome_encontrado}."
-
         except spotipy.SpotifyException as erro:
-            if erro.http_status == 403:
-                return "A conta do Spotify precisa ser Premium para tocar músicas por voz."
+            if erro.http_status == 403: return "A conta do Spotify precisa ser Premium para tocar músicas por voz."
             return "Ocorreu um erro de permissão ao acessar o Spotify."
-        except Exception as erro:
-            print(f"Erro interno Spotify: {erro}")
+        except Exception:
             return "Tive um problema ao tentar conectar com o Spotify."
 
     def pausar_musica(self) -> str:
@@ -454,7 +388,7 @@ class ServicoSpotify:
             self._sp.pause_playback()
             return "Música pausada."
         except spotipy.SpotifyException:
-            return "Não consegui pausar. Talvez a música já esteja pausada ou não haja dispositivo ativo."
+            return "Não consegui pausar."
 
     def retomar_musica(self) -> str:
         if not self._sp: return "Spotify não configurado."
@@ -462,7 +396,7 @@ class ServicoSpotify:
             self._sp.start_playback()
             return "Retomando a música."
         except spotipy.SpotifyException:
-            return "Não consegui retomar. Verifique se o aplicativo está aberto."
+            return "Não consegui retomar."
 
     def proxima_musica(self) -> str:
         if not self._sp: return "Spotify não configurado."
@@ -480,10 +414,9 @@ class ServicoSpotify:
         except spotipy.SpotifyException:
             return "Não consegui voltar a música."
 
-# Comandos de voz (padrão Command)
-class Comando(ABC):
-    """Um comando de voz: sabe se uma frase é sua (`corresponde`) e como executá-la."""
 
+# Comandos de voz
+class Comando(ABC):
     palavras_chave: List[str] = []
 
     def corresponde(self, texto_lower: str) -> bool:
@@ -491,11 +424,11 @@ class Comando(ABC):
 
     @abstractmethod
     def executar(self, texto_original: str, texto_lower: str, assistente: "AssistenteEva") -> Optional[str]:
-        """Executa o comando. Pode retornar "ENCERRAR" para pedir o fim do laço principal."""
+        pass
 
 
 class ComandoSair(Comando):
-    palavras_chave = ["sair", "desligar", "tchau"]
+    palavras_chave = ["sair", "desligar", "tchau", "voltar a dormir"]
 
     def executar(self, texto_original, texto_lower, assistente):
         assistente.voz.falar("Desligando. Até mais!")
@@ -511,10 +444,8 @@ class ComandoCalcular(Comando):
 
 class ComandoData(Comando):
     palavras_chave = ["que dia é hoje", "qual é o dia de hoje", "que dia é", "data de hoje"]
-    _MESES = [
-        "janeiro", "fevereiro", "março", "abril", "maio", "junho",
-        "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
-    ]
+    _MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
+              "novembro", "dezembro"]
 
     def executar(self, texto_original, texto_lower, assistente):
         agora = datetime.now()
@@ -543,42 +474,24 @@ class ComandoClima(Comando):
 
 
 class ComandoAdicionarTarefa(Comando):
-    palavras_chave = [
-        "adicionar uma tarefa",
-        "adicione uma tarefa",
-        "adicionar tarefa",
-        "anotar na agenda",
-        "anota na agenda",
-        "anote uma tarefa",
-    ]
+    palavras_chave = ["adicionar uma tarefa", "adicione uma tarefa", "adicionar tarefa", "anotar na agenda",
+                      "anota na agenda", "anote uma tarefa"]
 
     def executar(self, texto_original, texto_lower, assistente):
-        # 1. Verifica biometria
-        if not self._confirmar_pessoa_autorizada(assistente):
-            return
-
-        # 2. Descobre qual é a tarefa
+        if not self._confirmar_pessoa_autorizada(assistente): return
         tarefa = self._extrair_tarefa(texto_lower)
         if not tarefa:
-            tarefa = self._perguntar(assistente, "O que você quer que eu anote?")
-            if not tarefa:
-                return
-
-        # 3. NOVO: Pergunta a data e hora
-        quando = self._perguntar(assistente, f"Para quando é essa tarefa?")
-        if not quando:
-            quando = "sem data definida"
-
-        # 4. Salva a tarefa com a data/hora
+            tarefa = self._perguntar(assistente, "Para quem é o agendamento?")
+            if not tarefa: return
+        quando = self._perguntar(assistente, f"Para quando é esse agendamento?")
+        if not quando: quando = "sem data definida"
         assistente.voz.falar(assistente.agenda.adicionar(tarefa, quando))
 
     def _confirmar_pessoa_autorizada(self, assistente: "AssistenteEva") -> bool:
         assistente.voz.falar("Confirmando sua identidade.")
         pessoa = assistente.reconhecimento.identificar_pessoa_atual()
         assistente.usuario_atual = pessoa
-
         if pessoa is None or pessoa.lower() not in assistente.pessoas_autorizadas:
-            print("Acesso negado: pessoa não reconhecida/autorizada na confirmação.")
             assistente.voz.falar("Não consegui confirmar sua identidade, então não vou adicionar essa tarefa.")
             return False
         return True
@@ -587,18 +500,16 @@ class ComandoAdicionarTarefa(Comando):
         texto_lower = texto.lower()
         for gatilho in sorted(self.palavras_chave, key=len, reverse=True):
             indice = texto_lower.find(gatilho)
-            if indice != -1:
-                return texto[indice + len(gatilho):].strip(" ,.:")
+            if indice != -1: return texto[indice + len(gatilho):].strip(" ,.:")
         return ""
 
     @staticmethod
     def _perguntar(assistente: "AssistenteEva", pergunta: str) -> Optional[str]:
-        """Função auxiliar para fazer uma pergunta e ouvir a resposta em seguida."""
         assistente.voz.falar(pergunta)
         resposta = assistente.ouvir_resposta_simples()
-        if not resposta:
-            assistente.voz.falar("Não consegui te ouvir direito.")
+        if not resposta: assistente.voz.falar("Não consegui te ouvir direito.")
         return resposta
+
 
 class ComandoQuemSouEu(Comando):
     palavras_chave = ["quem sou eu", "quem esta ai", "quem está aí"]
@@ -615,18 +526,14 @@ class ComandoLerAgenda(Comando):
     palavras_chave = ["ler agenda", "minhas tarefas", "o que tem na agenda"]
 
     def executar(self, texto_original, texto_lower, assistente):
-        if not self._confirmar_pessoa_autorizada(assistente):
-            return
+        if not self._confirmar_pessoa_autorizada(assistente): return
         assistente.voz.falar(assistente.agenda.ler())
 
     def _confirmar_pessoa_autorizada(self, assistente: "AssistenteEva") -> bool:
-        """Reaproveita a lógica de segurança para evitar que qualquer um apague a agenda."""
         assistente.voz.falar("Confirmando sua identidade para ler a agenda.")
         pessoa = assistente.reconhecimento.identificar_pessoa_atual()
         assistente.usuario_atual = pessoa
-
         if pessoa is None or pessoa.lower() not in assistente.pessoas_autorizadas:
-            print("Acesso negado: pessoa não reconhecida/autorizada na confirmação.")
             assistente.voz.falar("Não consegui confirmar sua identidade, então não vou ler a agenda.")
             return False
         return True
@@ -636,44 +543,30 @@ class ComandoLimparAgenda(Comando):
     palavras_chave = ["limpar agenda", "apagar agenda", "esvaziar agenda", "apagar tarefas", "limpar tarefas"]
 
     def executar(self, texto_original, texto_lower, assistente):
-        if not self._confirmar_pessoa_autorizada(assistente):
-            return
-
+        if not self._confirmar_pessoa_autorizada(assistente): return
         assistente.voz.falar(assistente.agenda.limpar())
 
     def _confirmar_pessoa_autorizada(self, assistente: "AssistenteEva") -> bool:
-        """Reaproveita a lógica de segurança para evitar que qualquer um apague a agenda."""
         assistente.voz.falar("Confirmando sua identidade para apagar a agenda.")
         pessoa = assistente.reconhecimento.identificar_pessoa_atual()
         assistente.usuario_atual = pessoa
-
         if pessoa is None or pessoa.lower() not in assistente.pessoas_autorizadas:
-            print("Acesso negado: pessoa não reconhecida/autorizada na confirmação.")
             assistente.voz.falar("Não consegui confirmar sua identidade, então não vou apagar a agenda.")
             return False
         return True
 
 
 class ComandoTocarPlaylist(Comando):
-    palavras_chave = [
-        "tocar a playlist",
-        "tocar playlist",
-        "toca a playlist",
-        "reproduzir playlist",
-        "toca playlist"
-    ]
+    palavras_chave = ["tocar a playlist", "tocar playlist", "toca a playlist", "reproduzir playlist", "toca playlist"]
 
     def executar(self, texto_original, texto_lower, assistente):
         nome_playlist = self._extrair_playlist(texto_lower)
-
-        # Se o usuário disser apenas "Eva, tocar playlist", a assistente pergunta qual.
         if not nome_playlist:
             assistente.voz.falar("Qual o nome da playlist que você quer tocar?")
             nome_playlist = assistente.ouvir_resposta_simples()
             if not nome_playlist:
                 assistente.voz.falar("Não consegui ouvir o nome da playlist.")
                 return
-
         assistente.voz.falar("Buscando no Spotify, aguarde.")
         resposta = assistente.spotify.tocar_playlist(nome_playlist)
         assistente.voz.falar(resposta)
@@ -681,8 +574,7 @@ class ComandoTocarPlaylist(Comando):
     def _extrair_playlist(self, texto: str) -> str:
         for gatilho in sorted(self.palavras_chave, key=len, reverse=True):
             indice = texto.find(gatilho)
-            if indice != -1:
-                return texto[indice + len(gatilho):].strip(" ,.:")
+            if indice != -1: return texto[indice + len(gatilho):].strip(" ,.:")
         return ""
 
 
@@ -701,7 +593,8 @@ class ComandoMusicaAnterior(Comando):
 
 
 class ComandoPausarMusica(Comando):
-    palavras_chave = ["pausar música", "pausar a música", "pausar o spotify", "parar a música", "parar música"]
+    palavras_chave = ["pausar música", "pausar a música", "pausar o spotify", "parar a música", "parar música",
+                      "pausar"]
 
     def executar(self, texto_original, texto_lower, assistente):
         assistente.voz.falar(assistente.spotify.pausar_musica())
@@ -715,14 +608,17 @@ class ComandoRetomarMusica(Comando):
 
 
 class ComandoAumentarVolume(Comando):
-    palavras_chave = ["aumentar volume", "aumentar o volume", "aumenta o volume", "mais alto", "aumentar som", "aumentar o som"]
+    palavras_chave = ["aumentar volume", "aumentar o volume", "aumenta o volume", "mais alto", "aumentar som",
+                      "aumentar o som"]
 
     def executar(self, texto_original, texto_lower, assistente):
         assistente.voz.falar("Aumentando o volume do sistema.")
         assistente.volume.aumentar()
 
+
 class ComandoDiminuirVolume(Comando):
-    palavras_chave = ["diminuir volume", "diminuir o volume", "abaixar volume", "abaixar o volume", "mais baixo", "diminuir o som", "diminuir som", "diminui o som"]
+    palavras_chave = ["diminuir volume", "diminuir o volume", "abaixar volume", "abaixar o volume", "mais baixo",
+                      "diminuir o som", "diminuir som", "diminui o som"]
 
     def executar(self, texto_original, texto_lower, assistente):
         assistente.voz.falar("Abaixando o volume do sistema.")
@@ -736,7 +632,8 @@ class ComandoSorrir(Comando):
         assistente.voz.falar("Claro!")
         assistente.corpo.sorrir()
         time.sleep(3)
-        return None # Mantém a assistente ativa
+        return None
+
 
 class ComandoAcenar(Comando):
     palavras_chave = ["acene", "diga oi", "acenar", "dar oi", "oi", "olá"]
@@ -748,33 +645,16 @@ class ComandoAcenar(Comando):
 
 
 def comandos_padrao() -> List[Comando]:
-    """Lista padrão de comandos que a Eva sabe executar."""
     return [
-        ComandoSair(),
-        ComandoCalcular(),
-        ComandoData(),
-        ComandoHora(),
-        ComandoClima(),
-        ComandoAdicionarTarefa(),
-        ComandoQuemSouEu(),
-        ComandoLerAgenda(),
-        ComandoLimparAgenda(),
-        ComandoTocarPlaylist(),
-        ComandoProximaMusica(),
-        ComandoMusicaAnterior(),
-        ComandoPausarMusica(),
-        ComandoRetomarMusica(),
-        ComandoAumentarVolume(),
-        ComandoDiminuirVolume(),
-        ComandoSorrir(),
-        ComandoAcenar(),
+        ComandoSair(), ComandoCalcular(), ComandoData(), ComandoHora(), ComandoClima(),
+        ComandoAdicionarTarefa(), ComandoQuemSouEu(), ComandoLerAgenda(), ComandoLimparAgenda(),
+        ComandoTocarPlaylist(), ComandoProximaMusica(), ComandoMusicaAnterior(), ComandoPausarMusica(),
+        ComandoRetomarMusica(), ComandoAumentarVolume(), ComandoDiminuirVolume(), ComandoSorrir(), ComandoAcenar()
     ]
 
 
 # Roteamento
 class RoteadorDeComandos:
-    """Escolhe qual Comando atende a frase do usuário; se nenhum bater, cai no LLM."""
-
     def __init__(self, comandos: List[Comando], llm: ClienteLLM):
         self._comandos = comandos
         self._llm = llm
@@ -793,21 +673,17 @@ class RoteadorDeComandos:
 
 # Assistente principal
 class AssistenteEva:
-    """Orquestra o laço de escuta, a wake word e o estado da sessão (quem está autorizado)."""
-
     def __init__(
-        self,
-        reconhecimento: ReconhecimentoFacial,
-        voz: SintetizadorDeVoz,
-        clima: ServicoClima,
-        agenda: Agenda,
-        spotify: ServicoSpotify,
-        volume: ServicoVolume,
-        roteador: RoteadorDeComandos,
-        pessoas_autorizadas: set,
-        corpo: CorpoEva,
-        wake_word: str = WAKE_WORD,
-
+            self,
+            reconhecimento: ReconhecimentoFacial,
+            voz: SintetizadorDeVoz,
+            clima: ServicoClima,
+            agenda: Agenda,
+            spotify: ServicoSpotify,
+            volume: ServicoVolume,
+            roteador: RoteadorDeComandos,
+            pessoas_autorizadas: set,
+            corpo: CorpoEva,
     ):
         self.reconhecimento = reconhecimento
         self.voz = voz
@@ -817,64 +693,57 @@ class AssistenteEva:
         self.volume = volume
         self.roteador = roteador
         self.pessoas_autorizadas = pessoas_autorizadas
-        self._wake_word = wake_word
         self.corpo = corpo
-
         self.usuario_atual: Optional[str] = None
         self._reconhecedor_fala = sr.Recognizer()
 
-    def _cumprimentar(self) -> None:
-        self.corpo.acordar()  # 1. Acorda imediatamente (abre os olhos normais)
-        print("Tentando reconhecer quem está na frente da câmera...")
-
+    def iniciar_servico(self) -> None:
+        """Função chamada apenas 1 vez quando o script Python é iniciado."""
+        self.corpo.acordar()
+        print("\nInicializando e tentando reconhecer quem está na frente da câmera...")
         self.usuario_atual = self.reconhecimento.identificar_pessoa_atual()
+
         if self.usuario_atual:
-            self.voz.falar(f"Oi, {self.usuario_atual}! Só um momento...")
+            self.voz.falar(f"Oi, {self.usuario_atual}! O sistema está pronto.")
         else:
-            self.voz.falar("Sistema inicializando. Não consegui te reconhecer. Aguarde um momento...")
+            self.voz.falar("Sistema inicializado e pronto.")
 
-    def iniciar(self) -> None:
-        self._cumprimentar()
+        self.corpo.acenar()
+        # Após essa saudação, ela apenas fica calada esperando o Flask acioná-la via ESP32.
+        self.corpo.estado_normal()
+
+    def escutar_e_processar_comando(self) -> None:
+        """Função acionada via Flask quando o ESP32 escuta a palma."""
         with sr.Microphone() as microfone:
-            self._reconhecedor_fala.adjust_for_ambient_noise(microfone, duration=2)
+            self._reconhecedor_fala.adjust_for_ambient_noise(microfone, duration=0.5)
+            print("\n[Eva] Ouvindo seu comando...")
 
-            # 2. Acena e sorri quando está pronta para ouvir
-            self.corpo.acenar()
-            self.voz.falar("Obrigado por esperar. O sistema foi iniciado e agora estou ouvindo.")
-            self.corpo.estado_normal()  # Volta à expressão atenta/normal
-
-            self._laco_principal(microfone)
-
-    def _laco_principal(self, microfone) -> None:
-        while True:
-            print("\nOuvindo...")
             try:
-                audio = self._reconhecedor_fala.listen(microfone, timeout=5, phrase_time_limit=10)
+                # O ESP32 já acordou a tela, aqui só escutamos a voz real do usuário
+                audio = self._reconhecedor_fala.listen(microfone, timeout=6, phrase_time_limit=15)
                 texto = self._reconhecedor_fala.recognize_google(audio, language="pt-BR")
 
-                if self._wake_word in texto.lower():
-                    print(f"Você falou: {texto}")
+                print(f"Você falou: {texto}")
+                self.corpo.pensar()
 
-                    # 3. Fica com olhos pensativos enquanto processa o comando
-                    self.corpo.pensar()
+                resultado = self.roteador.rotear(texto, texto.lower(), self)
 
-                    resultado = self.roteador.rotear(texto, texto.lower(), self)
-
-                    if resultado == "ENCERRAR":
-                        self.corpo.dormir()  # 4. Tela preta ao desligar
-                        break
-                    else:
-                        self.corpo.estado_normal()  # Volta ao normal após responder a qualquer outro comando
+                if resultado == "ENCERRAR":
+                    self.corpo.dormir()
+                else:
+                    self.corpo.estado_normal()
 
             except sr.WaitTimeoutError:
-                pass
+                print("[Eva] Ninguém falou nada.")
+                self.corpo.estado_normal()
             except sr.UnknownValueError:
-                pass
+                print("[Eva] Não entendi o que foi falado.")
+                self.corpo.estado_normal()
             except Exception as erro:
-                print(f"Erro na captação: {erro}")
+                print(f"[Eva] Erro na captação: {erro}")
+                self.corpo.estado_normal()
 
     def ouvir_resposta_simples(self, timeout: int = 6, phrase_time_limit: int = 10) -> Optional[str]:
-        """Abre o microfone por uma frase só, para capturar a resposta a uma pergunta da Eva."""
         try:
             with sr.Microphone() as microfone:
                 self._reconhecedor_fala.adjust_for_ambient_noise(microfone, duration=0.5)
@@ -884,31 +753,21 @@ class AssistenteEva:
             return None
 
 
-
-
-# Composição e execução
 def montar_assistente() -> AssistenteEva:
-    """Cria e conecta todas as dependências da Eva (composition root)."""
     load_dotenv()
-
     reconhecimento = ReconhecimentoFacial()
     voz = SintetizadorDeVoz()
     llm = ClienteLLM()
     clima = ServicoClima(api_key=os.getenv("API_KEY_OPENWEATHER"))
     agenda = Agenda()
     volume = ServicoVolume()
-
     spotify = ServicoSpotify(
         client_id=os.getenv("SPOTIPY_CLIENT_ID"),
         client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
         redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI")
     )
-
-
     roteador = RoteadorDeComandos(comandos_padrao(), llm)
-
     corpo = CorpoEva(ip_esp32=os.getenv("IP_ESP32"))
-
     voz.definir_corpo(corpo)
 
     return AssistenteEva(
@@ -924,5 +783,39 @@ def montar_assistente() -> AssistenteEva:
     )
 
 
+# ROTAS DO FLASK
+@app.route('/iniciar_escuta', methods=['GET'])
+def endpoint_iniciar_escuta():
+    print("\n[GATILHO ESP32] Palma detetada! Ligando microfone...")
+    if assistente_global:
+        # Abre o microfone numa thread separada para não bloquear a resposta ao ESP32
+        threading.Thread(target=assistente_global.escutar_e_processar_comando).start()
+    return "Comando de voz iniciado", 200
+
+
+def rodar_servidor_flask():
+    app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
+
+
+# EXECUÇÃO PRINCIPAL
 if __name__ == "__main__":
-    montar_assistente().iniciar()
+    assistente_global = montar_assistente()
+
+    # Faz a saudação e reconhecimento inicial ao ligar o Python
+    assistente_global.iniciar_servico()
+
+    print("\n===================================================")
+    print("Servidor aguardando o chamado da Eva (Porta 5001)...")
+    print("===================================================")
+
+    # Roda o Flask em Background
+    thread_servidor = threading.Thread(target=rodar_servidor_flask)
+    thread_servidor.daemon = True
+    thread_servidor.start()
+
+    try:
+        # Mantém o script principal rodando sem consumir processamento
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nDesligando a Eva...")

@@ -1,1 +1,17 @@
-[]
+[
+    {
+        "tarefa": "Marcio",
+        "quando": "13 horas",
+        "data_registro": "07/11/2026 23:44"
+    },
+    {
+        "tarefa": "Victor",
+        "quando": "19",
+        "data_registro": "08/11/2026 00:06"
+    },
+    {
+        "tarefa": "Cláudia",
+        "quando": "sem data definida",
+        "data_registro": "08/11/2026 00:09"
+    }
+]
